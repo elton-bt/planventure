@@ -39,8 +39,8 @@ class Viagem(db.Model):
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
     
-    # Relationship with User
-    user = db.relationship('User', backref=db.backref('viagens', lazy=True, cascade='all, delete-orphan'))
+    # REMOVIDO: Não definir o relacionamento aqui para evitar conflito
+    # user = db.relationship('User', backref=db.backref('viagens', lazy=True, cascade='all, delete-orphan'))
     
     def __init__(self, user_id, destino, data_inicio, data_fim, **kwargs):
         self.user_id = user_id
@@ -63,7 +63,8 @@ class Viagem(db.Model):
             self.set_itinerario(itinerario)
     
     def __repr__(self):
-        return f'<Viagem {self.titulo or self.destino} - {self.user.email if self.user else "Unknown"}>'
+        # Acessar user através da foreign key de forma mais segura
+        return f'<Viagem {self.titulo or self.destino} - User ID: {self.user_id}>'
     
     def set_itinerario(self, itinerario_data):
         """Set itinerary data (converts dict/list to JSON string)"""
@@ -107,6 +108,11 @@ class Viagem(db.Model):
         self.latitude = float(latitude) if latitude is not None else None
         self.longitude = float(longitude) if longitude is not None else None
     
+    def get_user(self):
+        """Get user safely using query"""
+        from models.user import User
+        return User.query.get(self.user_id)
+    
     def to_dict(self, include_user=False, include_itinerario=True):
         """Convert trip to dictionary"""
         data = {
@@ -131,8 +137,10 @@ class Viagem(db.Model):
         if include_itinerario:
             data['itinerario'] = self.get_itinerario()
         
-        if include_user and self.user:
-            data['user'] = self.user.to_dict(include_timestamps=False)
+        if include_user:
+            user = self.get_user()
+            if user:
+                data['user'] = user.to_dict(include_timestamps=False)
         
         return data
     
