@@ -284,8 +284,9 @@ def check_db():
     
     with app.app_context():
         try:
-            # Test connection
-            db.session.execute('SELECT 1')
+            # Test connection with proper text() wrapper
+            from sqlalchemy import text
+            db.session.execute(text('SELECT 1'))
             click.echo('✓ Database connection: OK')
             
             # Check tables

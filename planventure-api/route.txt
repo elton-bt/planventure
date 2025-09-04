@@ -1,0 +1,632 @@
+"""
+Authentication routes for PlanVenture API
+Handles user registration, login, logout, email validation, and password reset
+"""
+from flask import Blueprint, request, jsonify, current_app
+from datetime import datetime, timezone
+import re
+import secrets
+from functools import wraps
+
+# Local imports
+from models.user import User, JWTUtils, PasswordUtils
+from database import db
+
+# Create blueprint for auth routes
+auth_bp = Blueprint('auth', __name__, url_prefix='/api/auth')
+
+def validate_request_data(required_fields, optional_fields=None):
+    """
+    Decorator to validate request JSON data
+    
+    Args:
+        required_fields (list): List of required field names
+        optional_fields (list): List of optional field names with default values
+    """
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if not request.is_json:
+                return jsonify({
+                    'success': False,
+                    'error': 'Content-Type must be application/json'
+                }), 400
+            
+            data = request.get_json()
+            if not data:
+                return jsonify({
+                    'success': False,
+                    'error': 'Request body must contain valid JSON'
+                }), 400
+            
+            # Check required fields
+            missing_fields = []
+            for field in required_fields:
+                if field not in data or not data[field]:
+                    missing_fields.append(field)
+            
+            if missing_fields:
+                return jsonify({
+                    'success': False,
+                    'error': f'Missing required fields: {", ".join(missing_fields)}'
+                }), 400
+            
+            # Add optional fields with defaults
+            if optional_fields:
+                for field, default_value in optional_fields.items():
+                    if field not in data:
+                        data[field] = default_value
+            
+            return f(data, *args, **kwargs)
+        return decorated_function
+    return decorator
+
+def jwt_required(f):
+    """Decorator to require valid JWT token"""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header:
+            return jsonify({
+                'success': False,
+                'error': 'Authorization header is missing'
+            }), 401
+        
+        try:
+            # Extract token from "Bearer <token>"
+            token_type, token = auth_header.split(' ')
+            if token_type.lower() != 'bearer':
+                raise ValueError("Invalid token type")
+        except ValueError:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid authorization header format. Use: Bearer <token>'
+            }), 401
+        
+        # Verify token and get user
+        user = User.get_user_from_token(token)
+        if not user:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid or expired token'
+            }), 401
+        
+        return f(user, *args, **kwargs)
+    return decorated
+
+@auth_bp.route('/register', methods=['POST'])
+@validate_request_data(
+    required_fields=['email', 'password'],
+    optional_fields={
+        'first_name': None,
+        'last_name': None,
+        'username': None
+    }
+)
+def register(data):
+    """
+    Register a new user
+    
+    Expected JSON:
+    {
+        "email": "user@example.com",
+        "password": "SecurePassword123!",
+        "first_name": "John",      // optional
+        "last_name": "Doe",        // optional
+        "username": "johndoe"      // optional
+    }
+    """
+    try:
+        # Extract data
+        email = data['email'].strip().lower()
+        password = data['password']
+        first_name = data.get('first_name', '').strip() or None
+        last_name = data.get('last_name', '').strip() or None
+        username = data.get('username', '').strip() or None
+        
+        # Additional validation
+        if len(email) > 120:
+            return jsonify({
+                'success': False,
+                'error': 'Email must be less than 120 characters'
+            }), 400
+        
+        if username and len(username) > 80:
+            return jsonify({
+                'success': False,
+                'error': 'Username must be less than 80 characters'
+            }), 400
+        
+        if first_name and len(first_name) > 50:
+            return jsonify({
+                'success': False,
+                'error': 'First name must be less than 50 characters'
+            }), 400
+        
+        if last_name and len(last_name) > 50:
+            return jsonify({
+                'success': False,
+                'error': 'Last name must be less than 50 characters'
+            }), 400
+        
+        # Create user
+        user = User.create_user(
+            email=email,
+            password=password,
+            first_name=first_name,
+            last_name=last_name,
+            username=username
+        )
+        
+        # Generate email verification token
+        verification_token = user.generate_email_verification_token()
+        
+        current_app.logger.info(f"User registered: {user.email}")
+        
+        return jsonify({
+            'success': True,
+            'message': 'User registered successfully',
+            'user': user.to_dict(include_timestamps=False),
+            'verification_token': verification_token,  # In production, send this via email
+            'next_steps': 'Please verify your email address to activate your account'
+        }), 201
+        
+    except ValueError as e:
+        current_app.logger.warning(f"Registration failed: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
+        
+    except Exception as e:
+        current_app.logger.error(f"Registration error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'An unexpected error occurred during registration'
+        }), 500
+
+@auth_bp.route('/login', methods=['POST'])
+@validate_request_data(required_fields=['email', 'password'])
+def login(data):
+    """
+    Authenticate user and return tokens
+    
+    Expected JSON:
+    {
+        "email": "user@example.com",
+        "password": "SecurePassword123!"
+    }
+    """
+    try:
+        email = data['email'].strip().lower()
+        password = data['password']
+        
+        # Authenticate user
+        auth_result = User.authenticate(email, password)
+        
+        if not auth_result['success']:
+            current_app.logger.warning(f"Login failed for {email}: {auth_result['error']}")
+            return jsonify({
+                'success': False,
+                'error': auth_result['error']
+            }), 401
+        
+        user = auth_result['user']
+        tokens = auth_result['tokens']
+        
+        current_app.logger.info(f"User logged in: {user.email}")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Login successful',
+            'access_token': tokens['access_token'],
+            'refresh_token': tokens['refresh_token'],
+            'token_type': tokens['token_type'],
+            'expires_in': tokens['expires_in'],
+            'user': user.to_dict(include_timestamps=False)
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Login error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'An unexpected error occurred during login'
+        }), 500
+
+@auth_bp.route('/refresh', methods=['POST'])
+@validate_request_data(required_fields=['refresh_token'])
+def refresh_token(data):
+    """
+    Refresh access token using refresh token
+    
+    Expected JSON:
+    {
+        "refresh_token": "your_refresh_token_here"
+    }
+    """
+    try:
+        refresh_token = data['refresh_token']
+        
+        # Verify refresh token and get payload
+        payload = JWTUtils.verify_token(refresh_token, 'refresh')
+        if not payload:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid or expired refresh token'
+            }), 401
+        
+        # Get user
+        user = User.query.get(payload.get('user_id'))
+        if not user or not user.is_active:
+            return jsonify({
+                'success': False,
+                'error': 'User not found or inactive'
+            }), 401
+        
+        # Verify refresh token belongs to user
+        if not user.verify_refresh_token(refresh_token):
+            return jsonify({
+                'success': False,
+                'error': 'Invalid refresh token'
+            }), 401
+        
+        # Generate new access token
+        new_tokens = user.refresh_access_token(refresh_token)
+        if not new_tokens:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to refresh token'
+            }), 401
+        
+        current_app.logger.info(f"Token refreshed for user: {user.email}")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Token refreshed successfully',
+            **new_tokens
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Token refresh error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'An unexpected error occurred during token refresh'
+        }), 500
+
+@auth_bp.route('/logout', methods=['POST'])
+@jwt_required
+def logout(current_user):
+    """
+    Logout user by invalidating refresh tokens
+    """
+    try:
+        current_user.logout()
+        
+        current_app.logger.info(f"User logged out: {current_user.email}")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Logged out successfully'
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Logout error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'An unexpected error occurred during logout'
+        }), 500
+
+@auth_bp.route('/verify-email', methods=['POST'])
+@validate_request_data(required_fields=['token'])
+def verify_email(data):
+    """
+    Verify user email with verification token
+    
+    Expected JSON:
+    {
+        "token": "verification_token_here"
+    }
+    """
+    try:
+        token = data['token']
+        
+        # Find user by verification token
+        user = User.find_by_verification_token(token)
+        if not user:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid or expired verification token'
+            }), 400
+        
+        # Verify and activate account
+        if user.verify_email_with_token(token):
+            current_app.logger.info(f"Email verified for user: {user.email}")
+            
+            return jsonify({
+                'success': True,
+                'message': 'Email verified successfully',
+                'user': user.to_dict(include_timestamps=False)
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid or expired verification token'
+            }), 400
+            
+    except Exception as e:
+        current_app.logger.error(f"Email verification error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'An unexpected error occurred during email verification'
+        }), 500
+
+@auth_bp.route('/resend-verification', methods=['POST'])
+@validate_request_data(required_fields=['email'])
+def resend_verification(data):
+    """
+    Resend email verification token
+    
+    Expected JSON:
+    {
+        "email": "user@example.com"
+    }
+    """
+    try:
+        email = data['email'].strip().lower()
+        
+        user = User.find_by_email(email)
+        if not user:
+            # Don't reveal if email exists or not for security
+            return jsonify({
+                'success': True,
+                'message': 'If the email exists, a verification link has been sent'
+            }), 200
+        
+        if user.is_verified:
+            return jsonify({
+                'success': False,
+                'error': 'Email is already verified'
+            }), 400
+        
+        # Generate new verification token
+        verification_token = user.generate_email_verification_token()
+        
+        current_app.logger.info(f"Verification email resent for: {user.email}")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Verification email sent',
+            'verification_token': verification_token  # In production, send this via email
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Resend verification error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'An unexpected error occurred'
+        }), 500
+
+@auth_bp.route('/forgot-password', methods=['POST'])
+@validate_request_data(required_fields=['email'])
+def forgot_password(data):
+    """
+    Request password reset token
+    
+    Expected JSON:
+    {
+        "email": "user@example.com"
+    }
+    """
+    try:
+        email = data['email'].strip().lower()
+        
+        user = User.find_by_email(email)
+        if not user:
+            # Don't reveal if email exists or not for security
+            return jsonify({
+                'success': True,
+                'message': 'If the email exists, a password reset link has been sent'
+            }), 200
+        
+        # Generate password reset token
+        reset_token = user.generate_password_reset_token()
+        
+        current_app.logger.info(f"Password reset requested for: {user.email}")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Password reset email sent',
+            'reset_token': reset_token  # In production, send this via email
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Forgot password error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'An unexpected error occurred'
+        }), 500
+
+@auth_bp.route('/reset-password', methods=['POST'])
+@validate_request_data(required_fields=['token', 'new_password'])
+def reset_password(data):
+    """
+    Reset password using reset token
+    
+    Expected JSON:
+    {
+        "token": "reset_token_here",
+        "new_password": "NewSecurePassword123!"
+    }
+    """
+    try:
+        token = data['token']
+        new_password = data['new_password']
+        
+        # Find user by reset token
+        user = User.find_by_reset_token(token)
+        if not user:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid or expired reset token'
+            }), 400
+        
+        # Reset password
+        user.reset_password_with_token(token, new_password)
+        
+        current_app.logger.info(f"Password reset completed for: {user.email}")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Password reset successfully'
+        }), 200
+        
+    except ValueError as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
+        
+    except Exception as e:
+        current_app.logger.error(f"Password reset error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'An unexpected error occurred during password reset'
+        }), 500
+
+@auth_bp.route('/change-password', methods=['POST'])
+@jwt_required
+@validate_request_data(required_fields=['current_password', 'new_password'])
+def change_password(current_user, data):
+    """
+    Change user password (requires authentication)
+    
+    Expected JSON:
+    {
+        "current_password": "CurrentPassword123!",
+        "new_password": "NewSecurePassword123!"
+    }
+    """
+    try:
+        current_password = data['current_password']
+        new_password = data['new_password']
+        
+        # Verify current password
+        if not current_user.check_password(current_password):
+            return jsonify({
+                'success': False,
+                'error': 'Current password is incorrect'
+            }), 400
+        
+        # Set new password
+        current_user.set_password(new_password)
+        db.session.commit()
+        
+        current_app.logger.info(f"Password changed for user: {current_user.email}")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Password changed successfully'
+        }), 200
+        
+    except ValueError as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
+        
+    except Exception as e:
+        current_app.logger.error(f"Change password error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'An unexpected error occurred while changing password'
+        }), 500
+
+@auth_bp.route('/profile', methods=['GET'])
+@jwt_required
+def get_profile(current_user):
+    """Get current user profile"""
+    try:
+        return jsonify({
+            'success': True,
+            'user': current_user.to_dict(include_security=True)
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Get profile error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'An unexpected error occurred'
+        }), 500
+
+@auth_bp.route('/validate-token', methods=['POST'])
+def validate_token():
+    """Validate if a token is still valid"""
+    auth_header = request.headers.get('Authorization')
+    if not auth_header:
+        return jsonify({
+            'success': False,
+            'valid': False,
+            'error': 'Authorization header is missing'
+        }), 401
+    
+    try:
+        token_type, token = auth_header.split(' ')
+        if token_type.lower() != 'bearer':
+            raise ValueError("Invalid token type")
+    except ValueError:
+        return jsonify({
+            'success': False,
+            'valid': False,
+            'error': 'Invalid authorization header format'
+        }), 401
+    
+    # Verify token
+    user = User.get_user_from_token(token)
+    if user:
+        return jsonify({
+            'success': True,
+            'valid': True,
+            'user': user.to_dict(include_timestamps=False)
+        }), 200
+    else:
+        return jsonify({
+            'success': False,
+            'valid': False,
+            'error': 'Invalid or expired token'
+        }), 401
+
+# Error handlers for the auth blueprint
+@auth_bp.errorhandler(400)
+def bad_request(error):
+    return jsonify({
+        'success': False,
+        'error': 'Bad request'
+    }), 400
+
+@auth_bp.errorhandler(401)
+def unauthorized(error):
+    return jsonify({
+        'success': False,
+        'error': 'Unauthorized'
+    }), 401
+
+@auth_bp.errorhandler(404)
+def not_found(error):
+    return jsonify({
+        'success': False,
+        'error': 'Endpoint not found'
+    }), 404
+
+@auth_bp.errorhandler(405)
+def method_not_allowed(error):
+    return jsonify({
+        'success': False,
+        'error': 'Method not allowed'
+    }), 405
+
+@auth_bp.errorhandler(500)
+def internal_error(error):
+    return jsonify({
+        'success': False,
+        'error': 'Internal server error'
+    }), 500
