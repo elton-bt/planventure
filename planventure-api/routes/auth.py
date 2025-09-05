@@ -11,6 +11,12 @@ from functools import wraps
 # Local imports
 from models.user import User, JWTUtils, PasswordUtils
 from database import db
+from middleware import (
+    jwt_required, 
+    rate_limited, 
+    validate_json,  # Usar este em vez de validate_request_data
+    get_current_user
+)
 
 # Create blueprint for auth routes
 auth_bp = Blueprint('auth', __name__, url_prefix='/api/auth')
@@ -62,41 +68,9 @@ def validate_request_data(required_fields, optional_fields=None):
         return decorated_function
     return decorator
 
-def jwt_required(f):
-    """Decorator to require valid JWT token"""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        auth_header = request.headers.get('Authorization')
-        if not auth_header:
-            return jsonify({
-                'success': False,
-                'error': 'Authorization header is missing'
-            }), 401
-        
-        try:
-            # Extract token from "Bearer <token>"
-            token_type, token = auth_header.split(' ')
-            if token_type.lower() != 'bearer':
-                raise ValueError("Invalid token type")
-        except ValueError:
-            return jsonify({
-                'success': False,
-                'error': 'Invalid authorization header format. Use: Bearer <token>'
-            }), 401
-        
-        # Verify token and get user
-        user = User.get_user_from_token(token)
-        if not user:
-            return jsonify({
-                'success': False,
-                'error': 'Invalid or expired token'
-            }), 401
-        
-        return f(user, *args, **kwargs)
-    return decorated
-
 @auth_bp.route('/register', methods=['POST'])
-@validate_request_data(
+@rate_limited(max_requests=5, window_minutes=15)
+@validate_json(
     required_fields=['email', 'password'],
     optional_fields={
         'first_name': None,
@@ -203,7 +177,8 @@ def register(data):
         }), 500
 
 @auth_bp.route('/login', methods=['POST'])
-@validate_request_data(required_fields=['email', 'password'])
+@rate_limited(max_requests=10, window_minutes=15)
+@validate_json(required_fields=['email', 'password'])
 def login(data):
     """
     Authenticate user and return JWT tokens
@@ -351,7 +326,7 @@ def refresh_token(data):
         }), 500
 
 @auth_bp.route('/logout', methods=['POST'])
-@jwt_required
+@jwt_required()  # Adicionar parênteses
 def logout(current_user):
     """
     Logout user by invalidating refresh tokens
@@ -557,7 +532,7 @@ def reset_password(data):
         }), 500
 
 @auth_bp.route('/change-password', methods=['POST'])
-@jwt_required
+@jwt_required()  # Adicionar parênteses
 @validate_request_data(required_fields=['current_password', 'new_password'])
 def change_password(current_user, data):
     """
@@ -605,7 +580,7 @@ def change_password(current_user, data):
         }), 500
 
 @auth_bp.route('/profile', methods=['GET'])
-@jwt_required
+@jwt_required()  # Adicionar os parênteses
 def get_profile(current_user):
     """Get current user profile"""
     try:
@@ -622,7 +597,7 @@ def get_profile(current_user):
         }), 500
 
 @auth_bp.route('/update-profile', methods=['PUT'])
-@jwt_required
+@jwt_required()  # Adicionar parênteses
 @validate_request_data(
     required_fields=[],
     optional_fields={

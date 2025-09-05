@@ -8,6 +8,7 @@ from sqlalchemy import text
 from config import config
 from database import init_db, create_tables
 from routes.auth import auth_bp
+from routes.viagens import viagens_bp  # Adicionar esta linha
 from middleware import auth_middleware
 
 def create_app(config_name=None):
@@ -34,6 +35,7 @@ def create_app(config_name=None):
     
     # Register blueprints
     app.register_blueprint(auth_bp)
+    app.register_blueprint(viagens_bp)  # Adicionar esta linha
     
     # Main routes
     @app.route('/')
@@ -45,6 +47,7 @@ def create_app(config_name=None):
             'status': 'active',
             'endpoints': {
                 'auth': '/api/auth',
+                'trips': '/api/viagens',  # Adicionar esta linha
                 'health': '/health',
                 'docs': '/api/docs'
             },
@@ -59,6 +62,18 @@ def create_app(config_name=None):
                 'reset_password': 'POST /api/auth/reset-password',
                 'change_password': 'POST /api/auth/change-password',
                 'validate_token': 'POST /api/auth/validate-token'
+            },
+            'available_trip_endpoints': {  # Adicionar esta seção
+                'list_trips': 'GET /api/viagens',
+                'create_trip': 'POST /api/viagens',
+                'get_trip': 'GET /api/viagens/{id}',
+                'update_trip': 'PUT /api/viagens/{id}',
+                'delete_trip': 'DELETE /api/viagens/{id}',
+                'update_status': 'PATCH /api/viagens/{id}/status',
+                'update_itinerary': 'PUT /api/viagens/{id}/itinerary',
+                'search_trips': 'GET /api/viagens/search',
+                'trip_stats': 'GET /api/viagens/stats',
+                'public_trips': 'GET /api/viagens/public'
             }
         })
 
