@@ -2,8 +2,9 @@
 Authentication Middleware for PlanVenture API
 Provides JWT authentication, rate limiting, and request validation
 """
+from flask import request, jsonify, current_app
+from flask import g
 from functools import wraps
-from flask import request, jsonify, current_app, g
 from datetime import datetime, timezone, timedelta
 import time
 from collections import defaultdict
@@ -23,10 +24,11 @@ from models.user import User, JWTUtils
 
 class AuthenticationError(Exception):
     """Custom exception for authentication errors"""
-    def __init__(self, message, status_code=401):
+    def __init__(self, message, status_code=401, reason="authentication_error"):
+        super().__init__(message)
         self.message = message
         self.status_code = status_code
-        super().__init__(self.message)
+        self.reason = reason
 
 class RateLimitError(Exception):
     """Custom exception for rate limiting errors"""
@@ -205,7 +207,7 @@ class AuthMiddleware:
             if not user.is_active:
                 raise AuthenticationError("Account is deactivated")
             
-            if user.is_account_locked():
+            if user.is_account_locked:
                 raise AuthenticationError("Account is temporarily locked")
             
             return user
@@ -250,107 +252,92 @@ class AuthMiddleware:
 # Global middleware instance
 auth_middleware = AuthMiddleware()
 
-def jwt_required(optional=False, permissions=None, rate_limit=None):
+def decode_and_resolve_user(token, expected_type="access"):
+    from models.user import User, JWTUtils
+    payload = JWTUtils.verify_token(token, expected_type=expected_type)
+    if not payload:
+        raise AuthenticationError("Invalid or expired token", reason="invalid_or_expired")
+    user_id = payload.get("user_id") or payload.get("sub")
+    if not user_id:
+        raise AuthenticationError("Missing user id in token", reason="missing_user_id")
+    user = User.query.get(int(user_id))
+    if not user:
+        raise AuthenticationError("User not found", reason="user_not_found")
+    if user.is_account_locked:
+        raise AuthenticationError("Account locked", reason="account_locked")
+    if not user.is_active:
+        raise AuthenticationError("User inactive", reason="user_inactive")
+    return user
+
+def jwt_required(_func=None, *, optional=False, permissions=None, expected_type="access"):
     """
-    Decorator to require JWT authentication
-    
-    Args:
-        optional (bool): If True, authentication is optional
-        permissions (list): Required permissions
-        rate_limit (dict): Rate limiting config {'max_requests': 100, 'window_minutes': 15}
-    
-    Usage:
+    Decorator para proteger rotas com JWT.
+    Pode ser usado como:
+        @jwt_required
+    ou:
         @jwt_required()
+    ou:
         @jwt_required(optional=True)
-        @jwt_required(permissions=['verified'])
-        @jwt_required(rate_limit={'max_requests': 10, 'window_minutes': 1})
+    Args:
+        optional (bool): se True, permite ausência de token (user = None)
+        permissions (list[str]): lista de permissões esperadas (placeholder futuro)
+        expected_type (str): tipo do token ("access" ou "refresh")
     """
-    def decorator(f):
-        @wraps(f)
-        def decorated(*args, **kwargs):
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            auth_header = request.headers.get("Authorization", "")
+            if not auth_header.startswith("Bearer "):
+                if optional:
+                    return fn(None, *args, **kwargs)
+                return jsonify({
+                    "success": False,
+                    "error": "Authorization header missing or malformed",
+                    "type": "authentication_error",
+                    "reason": "missing_header"
+                }), 401
+            token = auth_header.split(" ", 1)[1].strip()
             try:
-                # Rate limiting check
-                if rate_limit:
-                    client_ip = auth_middleware.get_client_ip(request)
-                    max_req = rate_limit.get('max_requests', 100)
-                    window = rate_limit.get('window_minutes', 15)
-                    
-                    if auth_middleware.is_rate_limited(
-                        f"ip:{client_ip}", 
-                        max_req, 
-                        window
-                    ):
-                        raise RateLimitError(
-                            f"Rate limit exceeded. Maximum {max_req} requests per {window} minutes."
-                        )
-                
-                # Extract token
-                token = auth_middleware.extract_token_from_request(request)
-                
-                if not token:
-                    if optional:
-                        # No token provided but it's optional
-                        g.current_user = None
-                        return f(*args, **kwargs)
-                    else:
-                        raise AuthenticationError("Authorization header is missing")
-                
-                # Validate token and get user
-                user = auth_middleware.validate_token(token)
-                
-                # Check permissions
-                if permissions and not auth_middleware.check_permissions(user, permissions):
-                    raise AuthenticationError("Insufficient permissions", 403)
-                
-                # User-based rate limiting (more restrictive for authenticated users)
-                if rate_limit and user:
-                    user_max_req = rate_limit.get('max_requests', 100) * 2  # Authenticated users get more requests
-                    user_window = rate_limit.get('window_minutes', 15)
-                    
-                    if auth_middleware.is_rate_limited(
-                        f"user:{user.id}", 
-                        user_max_req, 
-                        user_window
-                    ):
-                        raise RateLimitError(
-                            f"User rate limit exceeded. Maximum {user_max_req} requests per {user_window} minutes."
-                        )
-                
-                # Store user in Flask's g object for access in the route
+                user = decode_and_resolve_user(token, expected_type=expected_type)
+                # (placeholder) checar permissions se fornecidas
+                if permissions:
+                    # implementar lógica de permissões real no futuro
+                    pass
+                # disponibiliza no contexto caso outros usem
                 g.current_user = user
-                
-                # Log successful authentication
-                current_app.logger.info(f"Authenticated user: {user.email}")
-                
-                # Call the protected function with user as first argument
-                return f(user, *args, **kwargs)
-                
-            except (AuthenticationError, RateLimitError):
-                # Re-raise custom exceptions to be handled by error handlers
-                raise
+                return fn(user, *args, **kwargs)
+            except AuthenticationError as e:
+                if optional:
+                    return fn(None, *args, **kwargs)
+                return jsonify({
+                    "success": False,
+                    "error": e.message,
+                    "type": "authentication_error",
+                    "reason": e.reason
+                }), e.status_code
             except Exception as e:
-                current_app.logger.error(f"Authentication middleware error: {str(e)}")
-                raise AuthenticationError("Authentication failed")
-        
-        return decorated
+                current_app.logger.error(f"Unexpected auth error: {e}")
+                if optional:
+                    return fn(None, *args, **kwargs)
+                return jsonify({
+                    "success": False,
+                    "error": "Authentication process failed",
+                    "type": "authentication_error",
+                    "reason": "unexpected"
+                }), 401
+        return wrapper
+    # Se usado sem parênteses (@jwt_required)
+    if callable(_func):
+        return decorator(_func)
     return decorator
 
 def admin_required():
-    """
-    Decorator to require admin permissions
-    """
-    return jwt_required(permissions=['verified', 'admin'])
+    return jwt_required(permissions=['admin', 'verified'])
 
 def verified_required():
-    """
-    Decorator to require verified email
-    """
     return jwt_required(permissions=['verified'])
 
 def optional_auth():
-    """
-    Decorator for optional authentication
-    """
     return jwt_required(optional=True)
 
 def rate_limited(max_requests=100, window_minutes=15):
