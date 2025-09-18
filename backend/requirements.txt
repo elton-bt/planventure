@@ -35,7 +35,7 @@ flake8==7.0.0
 isort==5.13.2
 
 # Production server
-gunicorn==21.2.0
+gunicorn==23.0.0
 
 # Environment and configuration
 click==8.1.7
